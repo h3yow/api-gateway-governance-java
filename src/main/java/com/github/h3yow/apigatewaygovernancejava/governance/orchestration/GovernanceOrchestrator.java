@@ -57,11 +57,11 @@ public class GovernanceOrchestrator {
     }
 
     public GovernanceResponse handle(GovernanceRequest request) {
-        // 1) 限流：两维度两语义，拒绝原因可区分。
+        // 1) 限流：两维度两语义，拒绝原因可区分，并携带剩余额度与真实等待时间。
         RateLimitDecision rate = rateLimitService.check(request.callerId(), request.routeKey());
         if (!rate.allowed()) {
             logDecision(request, rate, null, "REJECTED:" + rate.reason());
-            throw new GovernanceException(rate.reason().errorCode(), rate.detail());
+            throw new GovernanceException(rate.reason().errorCode(), rate.detail(), rate);
         }
 
         // 2) 版本生命周期：未知/弃用/下线确定拒绝，不静默路由。

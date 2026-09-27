@@ -43,7 +43,20 @@ public final class FixedWindowQuotaLimiter {
      * @return true 表示放行；false 表示当前窗口配额已用尽
      */
     public boolean tryAcquire(long nowMillis) {
+        return acquire(nowMillis).allowed();
+    }
+
+    /**
+     * 一次原子判定的完整结论：allowed 与"本次占用后的窗口状态"来自同一次 CAS，
+     * 因此结论与计数严格自洽，不会出现"已用尽却放行"或"还有剩余却拒绝"。
+     *
+     * @param nowMillis 当前时刻（毫秒）
+     * @return 不可变结果：是否放行、当前窗口已用/剩余、本窗口起点与重置时刻；
+     *         被拒绝时 retryAfterMillis 为到下一窗口边界的真实等待（恒为正）
+     */
+    public AcquireResult acquire(long nowMillis) {
         long currentWindowStart = (nowMillis / windowMillis) * windowMillis;
+        long resetAt = currentWindowStart + windowMillis;
         while (true) {
             Window snapshot = windowRef.get();
             if (snapshot.start() != currentWindowStart) {
@@ -51,21 +64,51 @@ public final class FixedWindowQuotaLimiter {
                 // 翻转失败说明其他线程已推进，重读后继续，杜绝重复归零或丢计数。
                 Window rolled = new Window(currentWindowStart, 1L);
                 if (windowRef.compareAndSet(snapshot, rolled)) {
-                    return true;
+                    return new AcquireResult(true, 1L, quota - 1L, 0L,
+                            currentWindowStart, resetAt);
                 }
                 Thread.onSpinWait();
                 continue;
             }
             if (snapshot.count() >= quota) {
-                return false;
+                // 拒绝时刻的恢复时间 = 当前固定窗口剩余时长，绝不使用固定常量。
+                long waitMillis = Math.max(1L, resetAt - nowMillis);
+                return new AcquireResult(false, quota, 0L, waitMillis,
+                        currentWindowStart, resetAt);
             }
             // 同一窗口内：CAS 递增，每个配额只被一个请求拿走。
-            Window next = new Window(currentWindowStart, snapshot.count() + 1);
+            long nextCount = snapshot.count() + 1;
+            Window next = new Window(currentWindowStart, nextCount);
             if (windowRef.compareAndSet(snapshot, next)) {
-                return true;
+                return new AcquireResult(true, nextCount, quota - nextCount, 0L,
+                        currentWindowStart, resetAt);
             }
             Thread.onSpinWait();
         }
+    }
+
+    /**
+     * 只读观测：读取当前窗口的一致快照，不发生任何 CAS / 翻转 / 计数变更。
+     * 已滚动到历史窗口时按"新窗口尚未开始"归零呈现。
+     */
+    public WindowView peek(long nowMillis) {
+        long currentWindowStart = (nowMillis / windowMillis) * windowMillis;
+        long resetAt = currentWindowStart + windowMillis;
+        Window snapshot = windowRef.get();
+        long used = snapshot.start() == currentWindowStart ? snapshot.count() : 0L;
+        long remaining = Math.max(0L, quota - used);
+        return new WindowView(quota, used, remaining, currentWindowStart, resetAt);
+    }
+
+    /** 一次配额占用的完整结论（不可变）。拒绝时 retryAfterMillis 为正，放行时为 0。 */
+    public record AcquireResult(boolean allowed, long used, long remaining,
+                                long retryAfterMillis,
+                                long windowStartMillis, long resetAtMillis) {
+    }
+
+    /** 固定窗口只读视图：硬上限、已用、剩余、窗口起点与重置时刻。 */
+    public record WindowView(long limit, long used, long remaining,
+                             long windowStartMillis, long resetAtMillis) {
     }
 
     /** 仅供观测/测试：当前窗口已用量（尚未开始或已滚动的窗口为 0）。 */

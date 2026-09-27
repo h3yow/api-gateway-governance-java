@@ -41,6 +41,18 @@ public final class TokenBucketLimiter {
 
     /** 尝试取走 1 枚令牌；成功放行，桶空拒绝。 */
     public boolean tryAcquire(long nowMillis) {
+        return acquire(nowMillis).allowed();
+    }
+
+    /**
+     * 一次原子取令牌的完整结论：allowed 与"取走后桶内剩余"来自同一次 CAS，
+     * 结论与桶状态严格自洽。
+     *
+     * <p>被拒绝时 {@code retryAfterMillis} 按真实填充速率推算：
+     * {@code ceil((1 - 当前可用令牌) / refillTokensPerSecond * 1000)}，
+     * 即至少等到桶中补出第 1 枚令牌的时刻，绝不使用固定常量。
+     */
+    public AcquireResult acquire(long nowMillis) {
         while (true) {
             State snapshot = stateRef.get();
             long baseTime = snapshot.lastRefillMillis() < 0 ? nowMillis : snapshot.lastRefillMillis();
@@ -53,21 +65,43 @@ public final class TokenBucketLimiter {
                 if (nowMillis > baseTime) {
                     stateRef.compareAndSet(snapshot, new State(refilled, nowMillis));
                 }
-                return false;
+                long waitMillis = (long) Math.ceil(
+                        (1.0d - refilled) / refillTokensPerSecond * 1000.0d);
+                return new AcquireResult(false, capacity - refilled, refilled,
+                        Math.max(1L, waitMillis), capacity, refillTokensPerSecond);
             }
-            State next = new State(refilled - 1.0d, nowMillis);
+            double remaining = refilled - 1.0d;
+            State next = new State(remaining, nowMillis);
             if (stateRef.compareAndSet(snapshot, next)) {
-                return true;
+                return new AcquireResult(true, capacity - remaining, remaining,
+                        0L, capacity, refillTokensPerSecond);
             }
             Thread.onSpinWait();
         }
     }
 
-    /** 仅供观测/测试：当前可用令牌数（触发一次惰性填充后），上限为容量。 */
-    public double availableTokens(long nowMillis) {
+    /** 只读观测：读取当前桶的一致快照（惰性填充仅用于计算，不写回状态），不消耗令牌。 */
+    public BucketView peek(long nowMillis) {
         State snapshot = stateRef.get();
         long baseTime = snapshot.lastRefillMillis() < 0 ? nowMillis : snapshot.lastRefillMillis();
         double elapsedSeconds = Math.max(0L, nowMillis - baseTime) / 1000.0d;
-        return Math.min(capacity, snapshot.tokens() + elapsedSeconds * refillTokensPerSecond);
+        double available = Math.min(capacity, snapshot.tokens() + elapsedSeconds * refillTokensPerSecond);
+        return new BucketView(capacity, available, capacity - available, refillTokensPerSecond);
+    }
+
+    /** 仅供观测/测试：当前可用令牌数（触发一次惰性填充后），上限为容量。 */
+    public double availableTokens(long nowMillis) {
+        return peek(nowMillis).availableTokens();
+    }
+
+    /** 一次取令牌的完整结论（不可变）。remaining 为占用后桶内令牌；拒绝时 retryAfterMillis 为正。 */
+    public record AcquireResult(boolean allowed, double used, double remaining,
+                                long retryAfterMillis,
+                                long capacity, double refillTokensPerSecond) {
+    }
+
+    /** 令牌桶只读视图：容量、当前可用、已占用、每秒填充速率。 */
+    public record BucketView(long capacity, double availableTokens,
+                             double usedTokens, double refillTokensPerSecond) {
     }
 }

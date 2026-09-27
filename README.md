@@ -7,7 +7,11 @@
 2. **多版本治理**：同一能力多版本并行暴露、生命周期管理（ACTIVE / DEPRECATED / RETIRED）、
    字段级向后兼容与不兼容演进的确定性拒绝；
 3. **失败归一化与安全重试**：超时 / 连接失败 / 业务拒绝 / 未知错误映射为可区分错误类型，
-   仅对传输类故障重试，写操作通过幂等键保证重试不重复生效，内部细节不外露。
+   仅对传输类故障重试，写操作通过幂等键保证重试不重复生效，内部细节不外露；
+4. **可观测 + 可执行反馈**：每次结论携带两个维度两种口径的**剩余额度**
+   （响应体 + `X-*-Remaining` 响应头）；限流拒绝给出基于真实状态的 **`Retry-After`**；
+   错误按 **`rate_limited / client_error / server_error`** 稳定分类；
+   并提供只读运行期配额快照 `GET /api/govern/quotas`。
 
 全部能力仅依赖 Spring Boot Web 与 JDK，无外部服务、真实凭据或付费资源，可本地独立复现。
 
@@ -54,6 +58,90 @@
 > 说明：请求在某一维度“通过”时也会占用该维度的计数。因此当调用方配额更小时，
 > 后续请求会先收到 `rate_limit_caller_window`；待路由窗口计数也耗尽后会收到
 > `rate_limit_route_window`（见 `RateLimitHttpIntegrationTest` 的完整序列）。
+
+### 1.4 剩余额度反馈（可观测）
+
+每次请求（**放行和被拒都包括**）都会在结论里带上「服务路由 / 调用方」两个维度、
+区分两种口径的剩余额度，成功时在响应体 `rateLimit.quota` 与下列响应头中同时给出：
+
+| 响应头 | 口径 | 含义 |
+|---|---|---|
+| `X-Route-Window-Remaining` | 路由 · 固定窗口 | 当前窗口滚动重置前，路由维度还能放行的请求数（非负整数） |
+| `X-Route-Burst-Remaining` | 路由 · 令牌桶 | 路由维度当前可用突发令牌数（保留 3 位小数） |
+| `X-Caller-Window-Remaining` | 调用方 · 固定窗口 | 调用方维度窗口剩余配额（非负整数） |
+| `X-Caller-Burst-Remaining` | 调用方 · 令牌桶 | 调用方维度当前可用突发令牌数（保留 3 位小数） |
+
+**两种口径的语义区别（务必分开理解）：**
+
+- **固定窗口配额（window）= 硬上限**：`remaining = limit - used`。窗口滚动到
+  `resetAtMillis` 时 `used` 立即归零、`remaining` 恢复为 `limit`，是“到点一次性恢复”。
+- **突发容量（burst）= 令牌桶**：`availableTokens` 随时间**连续回补**
+  （每秒 `refillTokensPerSecond` 枚），桶满后新令牌丢弃、不累积；
+  不存在“某个固定时刻一次性恢复”。
+
+**自洽性保证：** 放行结论里的余额是“本次请求实际占用之后”的余额（因此放行后窗口余额
+必然严格小于上限、桶余额比请求前少 1）；被拒结论里被打满口径的剩余必然为 0。
+判定结果、余额与实际占用来自同一次原子 CAS，绝不出现“还剩 5 却被拒”或“已用尽仍放行”。
+未启用的口径不输出对应字段/响应头（序列化为 `null` 或缺头）。
+
+> 当请求在路由维度被短路拒绝时，调用方维度完全没有参与判定，其额度以**只读**方式呈现，
+> 不会因为这次拒绝而被占用。
+
+### 1.5 被限流后的等待时间（可执行反馈）
+
+限流拒绝（HTTP 429）除了保留可区分的具体 `errorCode`，还给出调用方可直接照做的等待时间：
+
+- 响应头：`Retry-After: <seconds>`（标准整秒，向上取整，保证至少等到恢复时刻）；
+- 响应体：`retryAfterSeconds`（与头部一致）与内部毫秒值。
+
+等待时间基于**当时的真实限流状态**推算，不是固定常量：
+
+- 命中**固定窗口配额**：`retryAfter = resetAtMillis - now`，即等到当前窗口滚动；
+- 命中**令牌桶突发**：`retryAfter = ceil((1 - 当前可用令牌) / refillTokensPerSecond)`，
+  即按填充速率补出第 1 枚令牌所需时间（填充越快，等待越短）。
+
+### 1.6 错误一级分类：该等、该改、还是服务端问题
+
+所有错误响应体新增 `category` 与 `retryable`，把“调用方自己能改好的问题”和
+“服务端自身故障”彻底分开：
+
+| category | retryable | 包含的 errorCode | 调用方该怎么做 |
+|---|---|---|---|
+| `rate_limited` | `true` | 4 个 `rate_limit_*` | 等 `Retry-After` 秒后**原样重试** |
+| `client_error` | `false` | `version_unknown/version_deprecated/version_retired`、`payload_*`、`missing_idempotency_key`、`idempotency_in_flight`、`downstream_business_rejected`，以及缺必传头/非法 JSON 的 `invalid_request` | **先按 message 修改请求**再提交，不要原样重试、更不用排查服务端 |
+| `server_error` | `false` | `downstream_timeout/connection_failed/unknown_error` | 网关已按自身策略重试，结论确定，调用方不要立即重试 |
+
+`message` 对调用方可执行：缺哪个头、哪个字段在哪个版本被删/改名、要改用哪个版本，
+都会明确写出；内部堆栈、下游地址等细节仍只入服务端日志。
+
+### 1.7 运行期只读配额快照
+
+`GET /api/govern/quotas` 返回所有已出现过的「路由 / 调用方」维度的实时配额快照：
+
+```json
+{
+  "capturedAtMillis": 1790534658767,
+  "routes": {
+    "orders": {
+      "key": "orders",
+      "window": { "limit": 60, "used": 12, "remaining": 48,
+                  "windowStartMillis": 1790534640000, "resetAtMillis": 1790534700000 },
+      "burst": { "capacity": 10, "availableTokens": 9.0,
+                 "usedTokens": 1.0, "refillTokensPerSecond": 5.0 },
+      "totalAllowed": 12,
+      "totalRejected": 1
+    }
+  },
+  "callers": { "...": "同结构" }
+}
+```
+
+- `window.used` 永不超过 `limit`；`burst.availableTokens` 永不超过 `capacity`、不为负；
+- `totalAllowed / totalRejected` 是该维度自进程启动起的**累计**计数（跨窗口不清零）；
+  在路由维度被短路的请求不计入调用方维度的任一计数；
+- 查询**只读**：不占用配额、不触发窗口翻转或令牌落盘、不改变任何计数，
+  也不会因为查询而凭空创建一个新维度；每个维度的字段取自同一不可变快照，
+  并发下读不到更新到一半的状态。
 
 ---
 
@@ -124,22 +212,44 @@
 
 - `POST /api/govern/orders`
 - `POST /api/govern/profiles`
+- `GET  /api/govern/quotas` —— 只读运行期配额快照（见 1.7）
 
 请求头：
 
 | 头 | 必填 | 说明 |
 |---|---|---|
-| `X-Caller-Id` | 是 | 调用方标识（限流维度） |
+| `X-Caller-Id` | 是 | 调用方标识（限流维度），缺失返回 400 `invalid_request` |
 | `X-Api-Version` | 是 | 如 `v1.1`、`v2.0` |
 | `X-Idempotency-Key` | 写操作必填 | 幂等键 |
 | `X-Failure-Scenario` | 否 | 本地故障注入：`timeout` / `connection` / `business` / `unknown` |
 
-成功响应（节选）：
+成功响应头（剩余额度，见 1.4）：
+
+```
+X-Route-Window-Remaining: 59
+X-Route-Burst-Remaining: 9.000
+X-Caller-Window-Remaining: 99
+X-Caller-Burst-Remaining: 19.000
+```
+
+成功响应（节选，`rateLimit.quota` 与上面的头同源）：
 
 ```json
 {
   "accepted": true,
-  "rateLimit": { "allowed": true, "reason": null, "detail": "allowed" },
+  "rateLimit": {
+    "allowed": true, "reason": null, "detail": "allowed",
+    "quota": {
+      "route":  { "window": { "limit": 60, "used": 1, "remaining": 59,
+                              "windowStartMillis": 1790534640000,
+                              "resetAtMillis": 1790534700000 },
+                  "burst":  { "capacity": 10, "availableTokens": 9.0,
+                              "usedTokens": 1.0, "refillTokensPerSecond": 5.0 } },
+      "caller": { "window": { "limit": 100, "used": 1, "remaining": 99, "...": "..." },
+                  "burst":  { "capacity": 20, "availableTokens": 19.0, "...": "..." } }
+    },
+    "retryAfterMillis": 0
+  },
   "resolvedVersion": "v2.0",
   "deduplicated": true,
   "attempts": 2,
@@ -147,11 +257,39 @@
 }
 ```
 
-失败响应：
+限流失败响应（429，注意 `Retry-After` 头与 `retryAfterSeconds`/`quota` 体）：
+
+```
+HTTP/1.1 429
+Retry-After: 42
+```
+```json
+{
+  "errorCode": "rate_limit_route_window",
+  "category": "rate_limited",
+  "httpStatus": 429,
+  "retryable": true,
+  "retryAfterSeconds": 42,
+  "message": "route=orders 固定窗口配额已用尽 (...)",
+  "quota": { "route": { "...": "剩余额度，结构同成功体" },
+             "caller": { "...": "短路维度只读快照" } }
+}
+```
+
+调用方可修正的问题（4xx，`category=client_error`、`retryable=false`）：
 
 ```json
-{ "errorCode": "rate_limit_caller_window", "httpStatus": 429,
-  "message": "caller=... 固定窗口配额已用尽 (...)" }
+{ "errorCode": "missing_idempotency_key", "category": "client_error",
+  "httpStatus": 400, "retryable": false,
+  "message": "写操作必须提供 X-Idempotency-Key 幂等键，否则不予执行以防重复生效" }
+```
+
+服务端故障（5xx，`category=server_error`、`retryable=false`，内部细节已脱敏）：
+
+```json
+{ "errorCode": "downstream_unknown_error", "category": "server_error",
+  "httpStatus": 500, "retryable": false,
+  "message": "下游发生未归类错误，未进行重试" }
 ```
 
 ---
@@ -178,36 +316,75 @@
 环境要求：JDK 21+、Maven 3.9+（在 JDK 25 上同样可构建）。
 
 ```bash
-# 1) 全量测试（29 个用例），单测日志会打印 请求输入 | 判定依据 | 最终结果
+# 1) 全量测试（55 个用例），单测日志会打印 请求输入 | 判定依据 | 最终结果
 mvn test
 
 # 2) 只跑关键场景
-mvn test -Dtest=RateLimitConcurrencyTest      # 并发限流不超额 + 四原因区分
-mvn test -Dtest=VersionBoundaryTest           # 版本生命周期 + 字段兼容边界
-mvn test -Dtest=RetryDeduplicationTest        # 重试安全 + 并发幂等去重
-mvn test -Dtest=GovernanceIntegrationTest     # 真实 HTTP 端到端
-mvn test -Dtest=RateLimitHttpIntegrationTest  # HTTP 层 429 原因码序列
+mvn test -Dtest=RateLimitConcurrencyTest          # 并发限流不超额 + 四原因区分
+mvn test -Dtest=RemainingQuotaTest                # 两口径剩余额度（滚动/回补边界）
+mvn test -Dtest=RateLimitFeedbackTest             # 拒绝等待时间 + 两维度额度自洽 + 快照只读
+mvn test -Dtest=QuotaConsistencyConcurrencyTest   # 高并发结论/计数/快照三方一致不超额
+mvn test -Dtest=ErrorClassificationTest           # rate_limited/client_error/server_error 分类契约
+mvn test -Dtest=ObservabilityHttpIntegrationTest  # HTTP：429 Retry-After/额度头/快照端点
+mvn test -Dtest=VersionBoundaryTest               # 版本生命周期 + 字段兼容边界
+mvn test -Dtest=RetryDeduplicationTest            # 重试安全 + 并发幂等去重
+mvn test -Dtest=GovernanceIntegrationTest         # 真实 HTTP 端到端
+mvn test -Dtest=RateLimitHttpIntegrationTest      # HTTP 层 429 原因码序列
 
 # 3) 启动服务后用 curl 手动验证
 mvn spring-boot:run
 ```
 
-手动验证示例：
+手动验证示例（在上面的正常调用之外，重点看新增反馈）：
 
 ```bash
-# 正常写调用（v2.0）
+# 剩余额度响应头（成功时也能看到本次占用后的余额）
 curl -i -X POST localhost:8080/api/govern/orders \
   -H 'X-Caller-Id: caller-1' -H 'X-Api-Version: v2.0' \
   -H 'X-Idempotency-Key: demo-1' -H 'Content-Type: application/json' \
   -d '{"itemId":"sku-1","quantity":2}'
+# 关注响应头：X-Route-Window-Remaining / X-Route-Burst-Remaining /
+#            X-Caller-Window-Remaining / X-Caller-Burst-Remaining
 
+# 被限流时的可执行反馈：连续打满配额后观察 Retry-After 与 body.category/quota
+for i in $(seq 1 70); do
+  curl -s -o /dev/null -D - -X POST localhost:8080/api/govern/orders \
+    -H 'X-Caller-Id: caller-burst' -H 'X-Api-Version: v2.0' \
+    -H "X-Idempotency-Key: burst-$i" -H 'Content-Type: application/json' \
+    -d '{"itemId":"sku-1","quantity":1}' | grep -iE 'HTTP/|Retry-After'
+done | tail -6
+# 429 响应：Retry-After: <秒>，body 含 category=rate_limited、retryable=true、
+#           retryAfterSeconds、quota（route/caller × window/burst）
+
+# 调用方错误 vs 服务端故障（category 字段）
+curl -s -X POST localhost:8080/api/govern/profiles \
+  -H 'X-Caller-Id: caller-1' -H 'X-Api-Version: v1.1' \
+  -H 'X-Idempotency-Key: p1' -H 'Content-Type: application/json' \
+  -d '{"userId":"u","email":"a@b","bogus":1}'      # -> category=client_error
+curl -s -X POST localhost:8080/api/govern/profiles \
+  -H 'X-Caller-Id: caller-1' -H 'X-Api-Version: v1.1' \
+  -H 'X-Idempotency-Key: p2' -H 'X-Failure-Scenario: unknown' \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"u","email":"a@b"}'                 # -> category=server_error
+
+# 只读配额快照（不消耗额度，可连续调用对比计数不变）
+curl -s localhost:8080/api/govern/quotas | python3 -m json.tool
+```
+
+> 想确定性地观察 429 与 Retry-After，可用极小配额启动：
+> `mvn spring-boot:run -Dspring-boot.run.arguments=
+> "--governance.rate-limit.routes.orders.window-quota=1,
+> --governance.rate-limit.routes.orders.window-millis=100000"`
+> 第 2 个请求即返回 429，窗口口径 `Retry-After` 约为 100 秒。
+
+```bash
 # 超时重试 + 幂等去重（首次超时后重试成功，deduplicated=true）
 curl -i -X POST localhost:8080/api/govern/orders \
   -H 'X-Caller-Id: caller-1' -H 'X-Api-Version: v2.0' \
   -H 'X-Idempotency-Key: demo-timeout' -H 'X-Failure-Scenario: timeout' \
   -H 'Content-Type: application/json' -d '{"itemId":"sku-1","quantity":1}'
 
-# 已删除字段（确定性拒绝，不静默接受）
+# 已删除字段（确定性拒绝，不静默接受；category=client_error）
 curl -i -X POST localhost:8080/api/govern/orders \
   -H 'X-Caller-Id: caller-1' -H 'X-Api-Version: v2.0' \
   -H 'X-Idempotency-Key: demo-2' -H 'Content-Type: application/json' \
@@ -231,12 +408,17 @@ curl -i -X POST localhost:8080/api/govern/orders \
 
 ```
 governance/
-├── common/        ErrorCode（稳定错误码+HTTP 映射）、GovernanceException、ErrorResponse
-├── ratelimit/     FixedWindowQuotaLimiter、TokenBucketLimiter、RateLimitService、原因枚举
+├── common/        ErrorCode（稳定错误码+HTTP 映射+一级分类）、ErrorCategory、GovernanceException、ErrorResponse
+├── ratelimit/     FixedWindowQuotaLimiter、TokenBucketLimiter（acquire 返回判定+占用后余额+恢复等待，peek 只读）
+│                  RateLimitService（两维度判定+剩余额度+真实等待+只读 snapshot）、
+│                  RateLimitDecision/QuotaReport/ScopeQuota（请求级反馈）、
+│                  RateLimitSnapshot/ScopeSnapshot（运维只读快照）、原因枚举
 ├── version/       ApiVersion、VersionRegistry、VersionRoutingService、PayloadValidator、契约模型
 ├── retry/         RetryExecutor、RetryPolicy、IdempotencyStore/InMemoryIdempotencyStore
 ├── downstream/    SimulatedDownstreamService（本地可复现下游 + 幂等台账 + 故障注入）
 ├── orchestration/ GovernanceOrchestrator（限流→版本→字段→幂等→重试 的确定编排）
-├── web/           GovernanceController、GlobalExceptionHandler（归一化 + 脱敏）
+├── web/           GovernanceController、QuotaSnapshotController（GET /api/govern/quotas）、
+│                  GlobalExceptionHandler（分类+Retry-After+缺头/坏 JSON 归一+脱敏）、
+│                  QuotaHeaderAdvice（成功响应写入 X-*-Remaining 头）
 └── config/        RateLimitProperties、RetryProperties、GovernanceConfig（版本契约注册）
 ```
