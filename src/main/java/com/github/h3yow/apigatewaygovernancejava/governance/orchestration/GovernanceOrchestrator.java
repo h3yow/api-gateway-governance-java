@@ -7,6 +7,7 @@ import com.github.h3yow.apigatewaygovernancejava.governance.downstream.Downstrea
 import com.github.h3yow.apigatewaygovernancejava.governance.downstream.DownstreamResponse;
 import com.github.h3yow.apigatewaygovernancejava.governance.downstream.SimulatedDownstreamService;
 import com.github.h3yow.apigatewaygovernancejava.governance.ratelimit.RateLimitDecision;
+import com.github.h3yow.apigatewaygovernancejava.governance.ratelimit.RateLimitRejectedException;
 import com.github.h3yow.apigatewaygovernancejava.governance.ratelimit.RateLimitService;
 import com.github.h3yow.apigatewaygovernancejava.governance.retry.IdempotencyStore;
 import com.github.h3yow.apigatewaygovernancejava.governance.retry.RetryExecutor;
@@ -57,11 +58,11 @@ public class GovernanceOrchestrator {
     }
 
     public GovernanceResponse handle(GovernanceRequest request) {
-        // 1) 限流：两维度两语义，拒绝原因可区分。
+        // 1) 限流：两维度两语义，拒绝原因可区分，结论携带剩余额度与等待时间。
         RateLimitDecision rate = rateLimitService.check(request.callerId(), request.routeKey());
         if (!rate.allowed()) {
             logDecision(request, rate, null, "REJECTED:" + rate.reason());
-            throw new GovernanceException(rate.reason().errorCode(), rate.detail());
+            throw new RateLimitRejectedException(rate);
         }
 
         // 2) 版本生命周期：未知/弃用/下线确定拒绝，不静默路由。
