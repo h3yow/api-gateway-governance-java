@@ -21,9 +21,11 @@ import java.util.function.LongSupplier;
  * </pre>
  * 任一环节拒绝即短路返回带明确原因的结论；全过才放行。
  *
- * <p>每次判定的 {@link RateLimitDecision} 还携带两个维度在两种口径下的剩余额度
- * 与恢复等待时间，数值与实际占用同源（取自同一次 CAS 结论），并发下确定一致。
- * 限流器按 key 懒加载并缓存在线程安全 Map 中，计数状态不会因并发丢失或错算。
+ * <p>每次判定的 {@link RateLimitDecision} 都同时携带两个维度在两种口径下的剩余
+ * 额度与恢复等待时间：实际判定的维度数值与占用同源（取自同一次 CAS 结论）；
+ * 因短路未判定的维度只按同一时刻真实状态只读投影，不占额度、不改计数。
+ * 并发下确定一致。限流器按 key 懒加载并缓存在线程安全 Map 中，
+ * 计数状态不会因并发丢失或错算。
  */
 @Service
 public class RateLimitService {
@@ -113,8 +115,14 @@ public class RateLimitService {
                 RateLimitRejectReason.ROUTE_WINDOW_QUOTA,
                 RateLimitRejectReason.ROUTE_BURST, "route=" + routeKey);
         if (!routeCheck.allowed()) {
+            // 路由维度短路拒绝时，调用方维度不做任何扣减，只按同一 now 时刻的真实
+            // 状态只读投影带回，保证结论始终同时携带两个维度；拒绝原因与等待时间
+            // 仍完全来自路由维度，不受只读投影影响。
+            ScopeState caller = callerStates.computeIfAbsent(callerId,
+                    k -> buildState(resolveCallerRule(k)));
             return RateLimitDecision.reject(routeCheck.reason(), routeCheck.detail(),
-                    routeCheck.quota(), null, routeCheck.retryAfterMillis());
+                    routeCheck.quota(), readOnlyQuota(caller, now),
+                    routeCheck.retryAfterMillis());
         }
 
         ScopeState caller = callerStates.computeIfAbsent(callerId,
@@ -145,11 +153,23 @@ public class RateLimitService {
             windowWait = w.retryAfterMillis();
             if (!w.allowed()) {
                 state.rejectedTotal.increment();
+                // 同维度的突发口径本次未走到，只按同一 now 时刻真实状态只读投影，
+                // 保证被拒结论仍同时带齐两种口径；不取令牌、不改桶状态。
+                Double readOnlyBurst = null;
+                Long readOnlyBurstWait = null;
+                if (state.burst != null) {
+                    TokenBucketLimiter.BurstView bv = state.burst.view(now);
+                    readOnlyBurst = bv.availableTokens();
+                    readOnlyBurstWait = bv.availableTokens() < 1.0d ? Math.max(1L,
+                            (long) Math.ceil((1.0d - bv.availableTokens()) * 1000.0d
+                                    / bv.refillPerSecond())) : 0L;
+                }
                 return new ScopeCheck(false, windowReason,
                         scope + " 固定窗口配额已用尽 (" + windowReason.description()
                                 + ")，预计 " + Math.max(1L, w.retryAfterMillis() / 1000L)
                                 + " 秒后窗口滚动恢复",
-                        RateLimitDecision.DimensionQuota.ofWindow(w.remaining(), w.retryAfterMillis()),
+                        merge(w.remaining(), w.retryAfterMillis(),
+                                readOnlyBurst, readOnlyBurstWait),
                         w.retryAfterMillis());
             }
         }
@@ -188,6 +208,35 @@ public class RateLimitService {
             return RateLimitDecision.DimensionQuota.ofBurst(burstRemaining, burstWait);
         }
         return null;
+    }
+
+    /**
+     * 只读投影一个维度的剩余额度：取自限流器 {@code view(now)} 的不可变快照，
+     * 不做任何 acquire/CAS、不占额度、不改计数（累计放行/拒绝计数也不动）。
+     *
+     * <p>用于某维度因短路未被实际判定时，仍按同一 {@code now} 时刻的真实状态
+     * 展示其两种口径的余量；该维度若当时也已耗尽，则其等待时间同样按真实状态
+     * 推算（只影响展示，不影响结论的拒绝原因与整体 {@code retryAfterMillis}）。
+     */
+    private RateLimitDecision.DimensionQuota readOnlyQuota(ScopeState state, long now) {
+        Long windowRemaining = null;
+        Long windowWait = null;
+        Double burstRemaining = null;
+        Long burstWait = null;
+        if (state.window != null) {
+            FixedWindowQuotaLimiter.WindowView v = state.window.view(now);
+            windowRemaining = v.remaining();
+            windowWait = v.remaining() == 0L ? Math.max(0L, v.windowEnd() - now) : 0L;
+        }
+        if (state.burst != null) {
+            TokenBucketLimiter.BurstView v = state.burst.view(now);
+            burstRemaining = v.availableTokens();
+            burstWait = v.availableTokens() < 1.0d
+                    ? Math.max(1L, (long) Math.ceil(
+                            (1.0d - v.availableTokens()) * 1000.0d / v.refillPerSecond()))
+                    : 0L;
+        }
+        return merge(windowRemaining, windowWait, burstRemaining, burstWait);
     }
 
     /** 维度内部判定结果；reason/detail 在组装对外结论时补齐。 */

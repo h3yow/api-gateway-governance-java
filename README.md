@@ -61,11 +61,15 @@
 
 ### 1.4 剩余额度反馈（响应头 + 响应体）
 
-每次请求的结论都会带上**两个维度 × 两种口径**的剩余额度，且与本次判定、实际占用
-取自同一次 CAS 结论，因此严格对得上：放行时剩余 = 上限 − 本次占用后已用；被拒时
-被拒口径剩余恒为 0，不会出现“还剩 5 却被拒”或“已用尽却放行”。
+每次请求的结论（无论放行还是 429）都会带上**两个维度 × 两种口径**的剩余额度，
+且与本次判定、实际占用严格对得上：实际参与判定的维度，数值取自同一次 CAS 结论，
+放行时剩余 = 上限 − 本次占用后已用，被拒时被拒口径剩余恒为 0，不会出现
+“还剩 5 却被拒”或“已用尽却放行”；因短路未参与判定的维度（例如请求先被路由维度
+拒掉时的调用方维度）按同一时刻的真实状态**只读投影**——不调用 acquire、不做 CAS、
+不占用额度、不改变任何计数，展示的就是“此刻它本来还剩多少”。
 
-响应头（成功响应与 429 响应均携带；某口径未启用或维度未判定时该头省略）：
+响应头（成功响应与 429 响应均携带；仅当某口径未启用时该头才省略，
+维度不会整体缺失）：
 
 | 响应头 | 口径 | 语义 |
 |---|---|---|
@@ -112,8 +116,12 @@
 | `*_window`（固定窗口） | `窗口结束时刻 − 当前时刻`（滚动后整配额恢复），向上取整到秒 |
 | `*_burst`（令牌桶） | `ceil((1 − 桶内现有令牌) / 填充速率 × 1000)`，桶内已有部分回补令牌时等待会相应缩短 |
 
-429 响应体同时带 `"category": "rate_limited"`；此时被拒维度的剩余额度头为 `0`，
-而已经通过并真实占用的另一维度（例如路由先过、调用方被拒）其剩余额度照常带回。
+429 响应体同时带 `"category": "rate_limited"`；此时被拒维度被拒口径的剩余额度头为
+`0`，而另一维度的两种口径余量也会同时带回：若该维度本次已真实判定（例如路由先过、
+调用方被拒时的路由），数值是扣减后的真实余量；若该维度因短路未判定（例如路由先拒、
+调用方完全没走到），数值是不占额度、不改计数的只读投影。只读投影不影响拒绝原因、
+`Retry-After` 等待时间，也不会因此多扣额度或改变后续请求的判定结果；补全调用方
+维度不会把限流误归成调用方错误或服务端故障，分类始终为 `rate_limited`。
 
 ### 1.6 只读配额快照：`GET /api/govern/rate-limits`
 
@@ -275,7 +283,7 @@
 ```
 
 限流失败响应（注意 `category` 与 `retryAfterSeconds`；响应头含
-`Retry-After` 与被拒后剩余额度）：
+`Retry-After` 与两个维度两种口径的剩余额度，短路维度为只读投影）：
 
 ```json
 { "errorCode": "rate_limit_caller_window", "httpStatus": 429,
@@ -315,12 +323,13 @@
 环境要求：JDK 21+、Maven 3.9+（在 JDK 25 上同样可构建）。
 
 ```bash
-# 1) 全量测试（50 个用例），单测日志会打印 请求输入 | 判定依据 | 最终结果
+# 1) 全量测试（57 个用例），单测日志会打印 请求输入 | 判定依据 | 最终结果
 mvn test
 
 # 2) 只跑关键场景
 mvn test -Dtest=RateLimitConcurrencyTest          # 并发限流不超额 + 四原因区分
 mvn test -Dtest=RateLimitQuotaObservationTest     # 两口径剩余额度 + 等待时间推算
+mvn test -Dtest=RateLimitDecisionCompletenessTest # 四种拒绝下两维度两口径都齐全 + 边界时刻 + 并发一致性
 mvn test -Dtest=RateLimitSnapshotConcurrencyTest  # 高并发结论一致性 + 快照强一致/零副作用
 mvn test -Dtest=ErrorClassificationTest           # 限流/调用方/服务端 三分类穷举
 mvn test -Dtest=ObservabilityHttpIntegrationTest  # HTTP：剩余额度头、Retry-After、快照端点
@@ -374,6 +383,31 @@ curl -i -X POST localhost:8080/api/govern/orders \
 - **突发容量**：`burst-capacity=2, refill-per-second=1`，打满后立刻被拒（约等 1s），
   若先等 500ms 再请求，桶内约有 0.5 枚令牌仍被拒，但 `retryAfterMillis` 缩到约 500ms
   （精确断言见 `RateLimitQuotaObservationTest.burstRetryWaitIsComputedFromRealRefillState`）。
+
+### “路由先拒、调用方只读补全”如何本地验证
+
+默认配置下 `orders` 路由突发桶只有 10（回补 5/s），而普通调用方窗口 100、突发 20，
+因此全新 caller 在短时间内打到第 11 次时会**先被路由突发口径挡住**（`rate_limit_route_burst`）。
+此时 429 响应仍应同时带回四个剩余额度头：调用方两个头展示其当时的真实余量
+（窗口还剩 90、突发 10），但这些数字只是只读投影，没有为本次被拒请求扣减任何额度。
+
+```bash
+# 短时间连发 12 次：第 11 次起 ROUTE_BURST，观察四个 X-RateLimit-*-Remaining 头
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -D - -X POST localhost:8080/api/govern/orders \
+    -H "X-Caller-Id: route-first-demo" -H 'X-Api-Version: v2.0' \
+    -H "X-Idempotency-Key: rf-$i" -H 'Content-Type: application/json' \
+    -d '{"itemId":"sku-1","quantity":1}' \
+    | grep -Ei 'HTTP/|^x-ratelimit|^retry-after' | tr '\n' ' '; echo
+done
+```
+
+只读不扣额度的验证方式：被路由突发挡住期间 `X-RateLimit-Caller-*-Remaining`
+保持 90 / 10 不变；随后若改打一条没有路由限额的路径（或等路由窗口/令牌恢复后再打），
+该调用方仍按 10 次真实占用后的余量继续判定，不会出现“被多扣”。
+四类拒绝（路由窗口 / 路由突发 / 调用方窗口 / 调用方突发）下两维度两口径齐全、
+窗口边界（t=99ms 被拒、t=100ms 恢复）与 32 线程并发下的数值对账，
+均由 `RateLimitDecisionCompletenessTest` 稳定复现。
 
 ### 测试日志样例
 

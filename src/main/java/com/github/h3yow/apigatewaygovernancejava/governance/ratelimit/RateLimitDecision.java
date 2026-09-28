@@ -13,8 +13,10 @@ package com.github.h3yow.apigatewaygovernancejava.governance.ratelimit;
  *       按填充速率持续回补（上限为桶容量）；被该口径拒绝时 {@code burstRetryAfterMillis}
  *       为回补到 1 枚令牌的真实毫秒数。</li>
  * </ul>
- * 字段为 null 表示该口径未启用或该维度尚未判定（短路）。剩余额度与判定、实际占用同源，
- * 不存在“有余量却被拒/已用尽却放行”的矛盾。
+ * 字段为 null 仅表示该口径未启用。两个维度的结论始终同时携带：被实际判定的维度，
+ * 剩余额度与判定、实际占用同源；因短路未实际判定的维度按同一时刻真实状态只读投影
+ * （不占额度、不改计数），因此不存在“有余量却被拒/已用尽却放行”的矛盾，
+ * 也不会出现某维度在结论里整体缺失的情况。
  */
 public record RateLimitDecision(boolean allowed, RateLimitRejectReason reason, String detail,
                                 DimensionQuota route, DimensionQuota caller,
@@ -33,10 +35,13 @@ public record RateLimitDecision(boolean allowed, RateLimitRejectReason reason, S
     /**
      * 单个维度（服务路由 / 调用方）在两种口径下的剩余额度观测。
      *
+     * <p>实际判定的维度取自本次 CAS 结论；短路未判定的维度为同一时刻真实状态的
+     * 只读投影（不占用额度、不改变计数），两种来源的语义一致。
+     *
      * @param windowRemaining        当前固定窗口剩余配额（非负整数）
-     * @param windowRetryAfterMillis 窗口配额耗尽时距窗口滚动的毫秒数；放行时为 0
+     * @param windowRetryAfterMillis 窗口配额耗尽时距窗口滚动的毫秒数；有余量时为 0
      * @param burstRemaining         当前可立即使用的突发容量（令牌数，0~容量，可为小于 1 的小数）
-     * @param burstRetryAfterMillis  桶空时回补到 1 枚令牌的毫秒数；放行时为 0
+     * @param burstRetryAfterMillis  桶内不足 1 枚时回补到 1 枚令牌的毫秒数；有余量时为 0
      */
     public record DimensionQuota(Long windowRemaining,
                                  Long windowRetryAfterMillis,

@@ -11,7 +11,6 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -171,12 +170,15 @@ class RateLimitQuotaObservationTest {
         assertEquals(0.0d, rejected.route().burstRemaining(), 1e-9);
         assertEquals(98L, rejected.route().windowRemaining(),
                 "突发耗尽不等于窗口配额耗尽，两种口径必须分开报告");
-        // 调用方维度尚未判定（在路由维度短路）
-        assertNull(rejected.caller());
+        // 调用方维度在路由维度短路，但仍以同一时刻真实状态只读带回：
+        // 窗口 100 已被第 1 次请求占用 1 -> 剩 99；突发桶容量 1 已被取空 -> 0。
+        assertNotNull(rejected.caller(), "短路维度也必须只读带回，不得整体缺失");
+        assertEquals(99L, rejected.caller().windowRemaining());
+        assertEquals(0.0d, rejected.caller().burstRemaining(), 1e-9);
         TestLogger.log("两口径独立报告",
                 "窗口=100 突发=1，连续2次",
-                "突发口径拒绝时窗口口径仍有余量，二者不互相冒充",
-                "route.burst=0 route.window=98 caller=null(短路)");
+                "突发口径拒绝时窗口口径仍有余量，二者不互相冒充；短路维度只读带回",
+                "route.burst=0 route.window=98 caller.window=99 caller.burst=0(只读)");
     }
 
     // ---------- helpers ----------
