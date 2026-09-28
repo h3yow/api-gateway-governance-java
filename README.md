@@ -61,20 +61,33 @@
 
 ### 1.4 剩余额度反馈（响应头 + 响应体）
 
-每次请求的结论都会带上**两个维度 × 两种口径**的剩余额度，且与本次判定、实际占用
-取自同一次 CAS 结论，因此严格对得上：放行时剩余 = 上限 − 本次占用后已用；被拒时
-被拒口径剩余恒为 0，不会出现“还剩 5 却被拒”或“已用尽却放行”。
+**无论放行（200）还是被限流（429）**，每次请求的结论都同时带上**两个维度 × 两种口径**
+的剩余额度。即使请求在第一个判定点（路由窗口）就被短路挡住，调用方维度的固定窗口与
+突发余量也**一个都不会少**——这是明确的对外契约，而不是“判到哪才返到哪”。
 
-响应头（成功响应与 429 响应均携带；某口径未启用或维度未判定时该头省略）：
+数值按该口径本次是否真实参与判定分为两种来源，但都取自同一判定时刻 `now`，严格对得上：
+
+- **实际占用口径**（走到判定并扣减了额度的口径）：数值与占用取自同一次 CAS 结论——
+  放行时剩余 = 上限 − 本次占用后已用；被拒时被拒口径剩余恒为 0（窗口）或不足 1 枚
+  令牌（突发），不会出现“还剩 5 却被拒”或“已用尽却放行”。
+- **只读展示口径**（因短路而未走到的口径，例如路由窗口先挡住时的路由突发、以及整个
+  调用方维度）：按**同一时刻的真实状态只读投影**（限流器的 `view()`），**不占用额度、
+  不推进窗口、不落盘令牌回补进度、不改变任何计数（含维度累计观测计数）、不影响拒绝
+  原因与顶层等待时间**；若该只读口径自身恰好也处于耗尽态，其自身的恢复等待字段会按
+  真实状态给出，但仅供信息展示。对从未出现过的调用方，按其规则展示满额初始状态，且
+  不会因此在快照端点中创建该调用方条目。
+
+响应头（成功响应与 429 响应均携带；仅当某口径在配置中被禁用时才省略）：
 
 | 响应头 | 口径 | 语义 |
 |---|---|---|
 | `X-RateLimit-Route-Window-Remaining` | 路由·固定窗口 | 当前窗口内还可再发多少次（硬上限 − 已用），窗口滚动后整体恢复 |
 | `X-RateLimit-Route-Burst-Remaining` | 路由·突发容量 | 令牌桶当前可**立即**放行的请求数（向下取整展示，0 表示不能再突发） |
-| `X-RateLimit-Caller-Window-Remaining` | 调用方·固定窗口 | 同上，调用方维度 |
-| `X-RateLimit-Caller-Burst-Remaining` | 调用方·突发容量 | 同上，调用方维度 |
+| `X-RateLimit-Caller-Window-Remaining` | 调用方·固定窗口 | 同上，调用方维度（被路由短路时为只读展示，不占额度） |
+| `X-RateLimit-Caller-Burst-Remaining` | 调用方·突发容量 | 同上，调用方维度（被路由短路时为只读展示，不抽令牌） |
 
-成功响应体的 `rateLimit` 内嵌对象同样给出这些值（突发口径为精确小数令牌数）：
+成功响应体的 `rateLimit` 内嵌对象同样给出这些值（突发口径为精确小数令牌数）。被路由
+限流的 429 错误体不内联 `rateLimit`，但四个剩余额度响应头同样齐全（与成功响应一致）：
 
 ```json
 "rateLimit": {
@@ -95,7 +108,8 @@
   响应头向下取整）。小于 1 意味着“已不能再立即放行”，但令牌正在回补。
 
 窗口滚动 / 令牌回补的边界时刻同样由 CAS 快照保证：同一时刻不同线程不会算出互相
-打架的数字（并发一致性见 `RateLimitSnapshotConcurrencyTest`）。
+打架的数字；只读投影与实际判定同源同时刻，不会口径串台
+（并发一致性见 `RateLimitSnapshotConcurrencyTest` 与 `RateLimitBothDimensionsReportTest`）。
 
 ### 1.5 被限流后等多久：`Retry-After`
 
@@ -112,8 +126,11 @@
 | `*_window`（固定窗口） | `窗口结束时刻 − 当前时刻`（滚动后整配额恢复），向上取整到秒 |
 | `*_burst`（令牌桶） | `ceil((1 − 桶内现有令牌) / 填充速率 × 1000)`，桶内已有部分回补令牌时等待会相应缩短 |
 
-429 响应体同时带 `"category": "rate_limited"`；此时被拒维度的剩余额度头为 `0`，
-而已经通过并真实占用的另一维度（例如路由先过、调用方被拒）其剩余额度照常带回。
+429 响应体同时带 `"category": "rate_limited"`；此时**被拒维度被拒口径**的剩余额度头
+为 `0`，其顶层 `Retry-After` 只按该被拒口径的真实恢复状态计算。另一维度（例如路由先
+挡住时的调用方维度）以及同维度另一口径的余量照常带回：已经真实占用的展示扣减后余量，
+未判定的只按同一时刻真实状态只读展示（不占额度、其自身等待字段不参与顶层 `Retry-After`，
+也不会把限流误归到该维度）。
 
 ### 1.6 只读配额快照：`GET /api/govern/rate-limits`
 
@@ -275,12 +292,20 @@
 ```
 
 限流失败响应（注意 `category` 与 `retryAfterSeconds`；响应头含
-`Retry-After` 与被拒后剩余额度）：
+`Retry-After` 与**两个维度**的剩余额度——被路由限流时调用方维度头同样出现、
+但只是只读展示，不占额度；原因码仍是 `*_route_*`，不会误归为调用方错误）：
 
 ```json
-{ "errorCode": "rate_limit_caller_window", "httpStatus": 429,
-  "category": "rate_limited", "retryAfterSeconds": 47,
-  "message": "caller=caller-1 固定窗口配额已用尽 (...)，预计 47 秒后窗口滚动恢复；请等待 47 秒后再试（无需修改请求）" }
+{ "errorCode": "rate_limit_route_window", "httpStatus": 429,
+  "category": "rate_limited", "retryAfterSeconds": 42,
+  "message": "route=profiles 固定窗口配额已用尽 (...)，预计 42 秒后窗口滚动恢复；请等待 42 秒后再试（无需修改请求）" }
+```
+
+```
+HTTP/1.1 429
+Retry-After: 42
+X-RateLimit-Route-Window-Remaining: 0      # 实际被拒口径：余量恒为 0
+X-RateLimit-Caller-Window-Remaining: 98    # 调用方本次未判定：只读展示真实余量，未扣额度
 ```
 
 调用方可修正失败响应（无 `retryAfterSeconds`）：
@@ -315,19 +340,21 @@
 环境要求：JDK 21+、Maven 3.9+（在 JDK 25 上同样可构建）。
 
 ```bash
-# 1) 全量测试（50 个用例），单测日志会打印 请求输入 | 判定依据 | 最终结果
+# 1) 全量测试（60 个用例），单测日志会打印 请求输入 | 判定依据 | 最终结果
 mvn test
 
 # 2) 只跑关键场景
-mvn test -Dtest=RateLimitConcurrencyTest          # 并发限流不超额 + 四原因区分
-mvn test -Dtest=RateLimitQuotaObservationTest     # 两口径剩余额度 + 等待时间推算
-mvn test -Dtest=RateLimitSnapshotConcurrencyTest  # 高并发结论一致性 + 快照强一致/零副作用
-mvn test -Dtest=ErrorClassificationTest           # 限流/调用方/服务端 三分类穷举
-mvn test -Dtest=ObservabilityHttpIntegrationTest  # HTTP：剩余额度头、Retry-After、快照端点
-mvn test -Dtest=VersionBoundaryTest               # 版本生命周期 + 字段兼容边界
-mvn test -Dtest=RetryDeduplicationTest            # 重试安全 + 并发幂等去重
-mvn test -Dtest=GovernanceIntegrationTest         # 真实 HTTP 端到端
-mvn test -Dtest=RateLimitHttpIntegrationTest      # HTTP 层 429 原因码序列
+mvn test -Dtest=RateLimitConcurrencyTest             # 并发限流不超额 + 四原因区分
+mvn test -Dtest=RateLimitQuotaObservationTest        # 两口径剩余额度 + 等待时间推算
+mvn test -Dtest=RateLimitSnapshotConcurrencyTest     # 高并发结论一致性 + 快照强一致/零副作用
+mvn test -Dtest=RateLimitBothDimensionsReportTest    # 四种拒绝两维同体 + 边界时刻 + 并发只读零占用
+mvn test -Dtest=RateLimitBothDimensionsHttpTest      # HTTP：被路由限流时调用方维度头仍齐全
+mvn test -Dtest=ErrorClassificationTest              # 限流/调用方/服务端 三分类穷举
+mvn test -Dtest=ObservabilityHttpIntegrationTest     # HTTP：剩余额度头、Retry-After、快照端点
+mvn test -Dtest=VersionBoundaryTest                  # 版本生命周期 + 字段兼容边界
+mvn test -Dtest=RetryDeduplicationTest               # 重试安全 + 并发幂等去重
+mvn test -Dtest=GovernanceIntegrationTest            # 真实 HTTP 端到端
+mvn test -Dtest=RateLimitHttpIntegrationTest         # HTTP 层 429 原因码序列
 
 # 3) 启动服务后用 curl 手动验证
 mvn spring-boot:run
@@ -350,6 +377,24 @@ for i in $(seq 1 102); do
     -H "X-Idempotency-Key: k-$i" -H 'Content-Type: application/json' \
     -d '{"itemId":"sku-1","quantity":1}' | grep -Ei 'HTTP/|retry-after|x-ratelimit'
 done
+
+# 复现“被路由先挡住，调用方维度仍只读带回”：
+# 先用极小路由配额启动（mvn spring-boot:run 的 JVM 参数或改 application.properties）：
+#   -Dgovernance.rate-limit.routes.profiles.window-quota=2 \
+#   -Dgovernance.rate-limit.defaults.window-quota=100
+# 然后同一 caller 连打 3 次 profiles（前 2 次 200，第 3 次 429）：
+for i in 1 2 3; do
+  echo "--- request $i ---"
+  curl -s -D - -o /tmp/body.json -X POST localhost:8080/api/govern/profiles \
+    -H 'X-Caller-Id: route-first-demo' -H 'X-Api-Version: v1.1' \
+    -H "X-Idempotency-Key: rf-$i" -H 'Content-Type: application/json' \
+    -d '{"userId":"u1","email":"a@example.com"}' \
+    | grep -Ei 'HTTP/|retry-after|x-ratelimit'
+  cat /tmp/body.json; echo
+done
+# 预期：第 3 次 HTTP/ 429 + errorCode=rate_limit_route_window（原因仍是路由，不会误归调用方），
+# X-RateLimit-Route-Window-Remaining=0，而 X-RateLimit-Caller-Window-Remaining=98
+# （调用方本次未判定、未扣额度，仅按当时真实状态只读展示）。
 
 # 只读配额快照（不改任何计数，可反复执行对比）
 curl -s localhost:8080/api/govern/rate-limits | python3 -m json.tool

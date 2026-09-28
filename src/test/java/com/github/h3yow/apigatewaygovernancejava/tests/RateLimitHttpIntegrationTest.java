@@ -52,7 +52,9 @@ class RateLimitHttpIntegrationTest {
     @SuppressWarnings("unchecked")
     void overQuotaReturnsDistinguishable429() {
         String url = "http://localhost:" + port + "/api/govern/orders";
-        String caller = "caller-http-rl";
+        // orders 路由在本 Spring 上下文内被多个测试方法共享，调用方必须唯一，
+        // 才能稳定复现“调用方窗口(2)先耗尽、第 6 次路由窗口(5)耗尽”的完整序列。
+        String caller = "caller-http-rl-" + Long.toHexString(System.nanoTime());
         int[] statuses = new int[6];
         String[] codes = new String[6];
 
@@ -60,7 +62,7 @@ class RateLimitHttpIntegrationTest {
             HttpHeaders h = new HttpHeaders();
             h.set("X-Caller-Id", caller);
             h.set("X-Api-Version", "v2.0");
-            h.set("X-Idempotency-Key", "idem-http-" + i);
+            h.set("X-Idempotency-Key", "idem-http-" + i + "-" + caller);
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(
                     Map.of("itemId", "sku", "quantity", 1), h);
             // 用 Map 接收，兼容 200 的 GovernanceResponse 与 429 的 ErrorResponse。
